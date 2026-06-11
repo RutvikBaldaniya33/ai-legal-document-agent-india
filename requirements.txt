@@ -4,7 +4,7 @@ pymongo==4.7.2
 google-generativeai==0.5.4
 python-dotenv==1.0.1
 pydantic==2.7.1
-PyMuPDF==1.24.3
+PyMuPDF>=1.25.0
 streamlit>=1.40.0
 starlette>=0.37.0
 Pillow>=11.0.0
