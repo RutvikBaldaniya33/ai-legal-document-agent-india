@@ -1,0 +1,639 @@
+"""
+AI Legal Document Agent — India
+Streamlit UI for end-to-end legal document processing.
+
+Run: streamlit run app.py
+"""
+
+import os
+import sys
+import json
+import tempfile
+from pathlib import Path
+from typing import Optional
+from io import BytesIO
+
+import streamlit as st
+
+from classifier import classify_case
+from law_retriever import get_relevant_laws
+from evidence_extractor import extract_evidence_from_document
+from case_strength import calculate_case_strength, get_strength_label
+from legal_notice import generate_legal_notice
+from utils import validate_env_variables, clean_text
+
+
+# ─────────────────────────────────────────────────────────
+# Page Configuration
+# ─────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="AI Legal Document Agent",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Custom CSS for minimalist design
+st.markdown("""
+<style>
+    /* Minimalist black and white theme */
+    :root {
+        --primary-color: #000000;
+        --background-color: #FFFFFF;
+        --text-color: #000000;
+        --border-color: #E0E0E0;
+    }
+    
+    /* Hide Streamlit branding */
+    #MainMenu {display: none;}
+    footer {display: none;}
+    
+    /* Clean header styling */
+    .stTitle {
+        font-size: 2.5rem !important;
+        font-weight: 700 !important;
+        margin-bottom: 0.5rem !important;
+        color: #000000 !important;
+    }
+    
+    /* Section headers */
+    .stMarkdown h2 {
+        border-bottom: 2px solid #000000;
+        padding-bottom: 0.5rem;
+        margin-top: 1.5rem !important;
+    }
+    
+    /* Minimal card styling */
+    .result-card {
+        border: 1px solid #E0E0E0;
+        border-radius: 0;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        background-color: #FAFAFA;
+    }
+    
+    /* Button styling */
+    .stButton > button {
+        width: 100%;
+        border: 1px solid #000000;
+        border-radius: 0;
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+        font-weight: 600 !important;
+    }
+    
+    .stButton > button:hover {
+        background-color: #333333 !important;
+    }
+    
+    /* Sidebar styling */
+    [data-testid="stSidebar"] {
+        background-color: #F5F5F5;
+    }
+    
+    /* Input fields */
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea,
+    .stSelectbox > div > div > select {
+        border: 1px solid #CCCCCC !important;
+        border-radius: 0 !important;
+        background-color: #FFFFFF !important;
+    }
+    
+    /* Remove extra spacing */
+    .element-container {
+        margin: 0 !important;
+    }
+    
+    /* Score display */
+    .score-display {
+        font-size: 2rem;
+        font-weight: bold;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────
+# Initialize Session State
+# ─────────────────────────────────────────────────────────
+
+def _init_session():
+    """Initialize session state variables."""
+    if "case_data" not in st.session_state:
+        st.session_state.case_data = None
+    if "uploaded_files" not in st.session_state:
+        st.session_state.uploaded_files = []
+    if "extracted_facts" not in st.session_state:
+        st.session_state.extracted_facts = {}
+    if "processing" not in st.session_state:
+        st.session_state.processing = False
+    if "error" not in st.session_state:
+        st.session_state.error = None
+    if "claimant_name" not in st.session_state:
+        st.session_state.claimant_name = ""
+    if "respondent_name" not in st.session_state:
+        st.session_state.respondent_name = ""
+
+
+_init_session()
+
+
+# ─────────────────────────────────────────────────────────
+# Sidebar Configuration
+# ─────────────────────────────────────────────────────────
+
+def render_sidebar():
+    """Render the sidebar panel."""
+    with st.sidebar:
+        st.markdown("### 📄 DOCUMENTS")
+        
+        # File uploader
+        uploaded_files = st.file_uploader(
+            "Upload supporting documents (PDF, Images)",
+            type=["pdf", "png", "jpg", "jpeg", "gif", "webp"],
+            accept_multiple_files=True,
+            help="Upload evidence documents like contracts, receipts, screenshots, etc.",
+        )
+        
+        if uploaded_files:
+            st.session_state.uploaded_files = uploaded_files
+            st.info(f"✓ {len(uploaded_files)} file(s) uploaded")
+            
+            # Show option to extract from these files
+            if st.checkbox("🔍 Auto-extract facts from documents"):
+                with st.spinner("Extracting facts from documents..."):
+                    extract_all_documents()
+        
+        # Party information
+        st.markdown("### 👤 PARTIES")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.claimant_name = st.text_input(
+                "Claimant Name",
+                value=st.session_state.claimant_name,
+                placeholder="Your name",
+                key="claimant_input",
+            )
+        
+        with col2:
+            st.session_state.respondent_name = st.text_input(
+                "Respondent Name",
+                value=st.session_state.respondent_name,
+                placeholder="Other party",
+                key="respondent_input",
+            )
+        
+        # Settings
+        st.markdown("### ⚙️ SETTINGS")
+        
+        if st.checkbox("Show raw API responses", value=False):
+            st.session_state.show_debug = True
+        else:
+            st.session_state.show_debug = False
+        
+        st.divider()
+        
+        # Status
+        if st.session_state.case_data:
+            st.success("✓ Case processed successfully")
+        
+        if st.session_state.error:
+            st.error(f"❌ Error: {st.session_state.error}")
+
+
+def extract_all_documents():
+    """Extract facts from all uploaded documents."""
+    all_facts = {
+        "names": [],
+        "dates": [],
+        "amounts": [],
+        "addresses": [],
+        "important_facts": [],
+        "raw_text": "",
+    }
+    
+    for file in st.session_state.uploaded_files:
+        try:
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.name).suffix) as tmp:
+                tmp.write(file.getbuffer())
+                tmp_path = tmp.name
+            
+            # Extract
+            facts = extract_evidence_from_document(tmp_path)
+            
+            # Merge facts
+            all_facts["names"].extend(facts.names)
+            all_facts["dates"].extend(facts.dates)
+            all_facts["amounts"].extend(facts.amounts)
+            all_facts["addresses"].extend(facts.addresses)
+            all_facts["important_facts"].extend(facts.important_facts)
+            all_facts["raw_text"] += facts.raw_text + "\n"
+            
+            # Clean up
+            os.unlink(tmp_path)
+            
+        except Exception as e:
+            st.warning(f"⚠️ Could not extract from {file.name}: {str(e)}")
+    
+    st.session_state.extracted_facts = all_facts
+    st.success(f"✓ Extracted facts from {len(st.session_state.uploaded_files)} document(s)")
+
+
+# ─────────────────────────────────────────────────────────
+# Main Content Area
+# ─────────────────────────────────────────────────────────
+
+def render_main():
+    """Render the main content area."""
+    
+    # Header
+    st.title("⚖️ AI Legal Document Agent")
+    st.caption("Classify disputes → Retrieve laws → Extract evidence → Calculate strength → Generate notice")
+    
+    st.divider()
+    
+    # Dispute Input
+    st.markdown("### 📋 DESCRIBE YOUR DISPUTE")
+    
+    dispute_text = st.text_area(
+        "Enter dispute details",
+        placeholder="""Example: I rented a flat in Gujarat for ₹15,000/month. The owner suddenly increased it to ₹20,000 without notice. I have a signed agreement. It's been 3 years and he's now asking me to vacate illegally...""",
+        height=120,
+        label_visibility="collapsed",
+    )
+    
+    # Party info reminder
+    col1, col2, col3 = st.columns([1.5, 1.5, 1])
+    
+    with col1:
+        if not st.session_state.claimant_name:
+            st.warning("⚠️ Add your name in sidebar")
+        else:
+            st.info(f"✓ Claimant: {st.session_state.claimant_name}")
+    
+    with col2:
+        if not st.session_state.respondent_name:
+            st.warning("⚠️ Add other party name in sidebar")
+        else:
+            st.info(f"✓ Respondent: {st.session_state.respondent_name}")
+    
+    with col3:
+        docs_count = len(st.session_state.uploaded_files)
+        if docs_count > 0:
+            st.success(f"✓ {docs_count} docs")
+        else:
+            st.info("No docs")
+    
+    st.divider()
+    
+    # Process Button
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        process_button = st.button(
+            "🚀 PROCESS & GENERATE LEGAL NOTICE",
+            type="primary",
+            use_container_width=True,
+        )
+    
+    with col2:
+        if st.button("🔄 Clear All"):
+            st.session_state.case_data = None
+            st.session_state.uploaded_files = []
+            st.session_state.extracted_facts = {}
+            st.rerun()
+    
+    st.divider()
+    
+    # Processing Logic
+    if process_button:
+        if not dispute_text.strip():
+            st.error("❌ Please enter dispute details")
+            return
+        
+        if not st.session_state.claimant_name:
+            st.error("❌ Please enter claimant name in sidebar")
+            return
+        
+        if not st.session_state.respondent_name:
+            st.error("❌ Please enter respondent name in sidebar")
+            return
+        
+        # Process the case
+        try:
+            with st.spinner("🔄 Processing your case..."):
+                st.session_state.case_data = process_case(
+                    dispute_text,
+                    st.session_state.claimant_name,
+                    st.session_state.respondent_name,
+                    st.session_state.extracted_facts,
+                )
+            
+            st.session_state.error = None
+            st.success("✓ Case processed successfully!")
+            
+        except Exception as e:
+            st.session_state.error = str(e)
+            st.error(f"❌ Processing failed: {str(e)}")
+            return
+    
+    # Display Results
+    if st.session_state.case_data:
+        st.markdown("---")
+        st.markdown("## 📊 RESULTS")
+        
+        display_case_results(st.session_state.case_data)
+
+
+def process_case(
+    dispute_text: str,
+    claimant_name: str,
+    respondent_name: str,
+    extracted_facts: dict,
+) -> dict:
+    """
+    Process a complete case end-to-end.
+    
+    Returns dict with all analysis results.
+    """
+    results = {}
+    
+    # Step 1: Classify
+    st.write("📍 Classifying dispute...")
+    classification = classify_case(dispute_text)
+    results["classification"] = classification
+    
+    # Step 2: Retrieve Laws
+    st.write(f"📚 Retrieving laws for {classification.dispute_type}...")
+    laws = get_relevant_laws(classification.dispute_type, classification.state)
+    results["laws"] = [law.dict() for law in laws]
+    
+    # Step 3: Extract Facts (if not already done)
+    st.write("📋 Extracted facts from documents and text...")
+    if not extracted_facts or len(extracted_facts.get("important_facts", [])) == 0:
+        extracted_facts = {
+            "names": [claimant_name, respondent_name],
+            "dates": [],
+            "amounts": [],
+            "addresses": [classification.state] if classification.state else [],
+            "important_facts": [dispute_text[:200]],
+            "raw_text": dispute_text,
+        }
+    results["extracted_facts"] = extracted_facts
+    
+    # Step 4: Calculate Case Strength
+    st.write("📊 Analyzing case strength...")
+    case_strength = calculate_case_strength(
+        dispute_description=dispute_text,
+        dispute_type=classification.dispute_type,
+        extracted_facts=extracted_facts,
+        relevant_laws=results["laws"],
+    )
+    results["case_strength"] = case_strength.dict()
+    
+    # Step 5: Generate Legal Notice
+    st.write("✍️ Generating legal notice...")
+    legal_notice = generate_legal_notice(
+        dispute_description=dispute_text,
+        dispute_type=classification.dispute_type,
+        claimant_name=claimant_name,
+        respondent_name=respondent_name,
+        state=classification.state or "Not Specified",
+        extracted_facts=extracted_facts,
+        case_strength=results["case_strength"],
+        relevant_laws=results["laws"],
+    )
+    results["legal_notice"] = legal_notice.dict()
+    
+    return results
+
+
+def display_case_results(case_data: dict):
+    """Display all case analysis results."""
+    
+    # Create tabs for different sections
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📍 Classification",
+        "📚 Relevant Laws",
+        "📋 Extracted Facts",
+        "📊 Case Strength",
+        "✍️ Legal Notice",
+    ])
+    
+    # Tab 1: Classification
+    with tab1:
+        classification = case_data["classification"]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric(
+                "Dispute Type",
+                classification.dispute_type.upper(),
+            )
+        
+        with col2:
+            st.metric(
+                "State",
+                classification.state or "Not Specified",
+            )
+        
+        st.markdown("""
+        **What this means:**
+        - The system has classified your dispute and identified the relevant jurisdiction
+        - This determines which laws and procedures will apply to your case
+        """)
+    
+    # Tab 2: Relevant Laws
+    with tab2:
+        laws = case_data["laws"]
+        
+        if not laws:
+            st.info("No specific laws found in database. General laws will apply.")
+        else:
+            for i, law in enumerate(laws, 1):
+                with st.expander(f"{i}. {law.get('title', 'Unknown Law')} ({law.get('state', 'National')})"):
+                    st.markdown(f"**Category:** {law.get('category', 'N/A')}")
+                    st.markdown(f"**State:** {law.get('state', 'National')}")
+                    
+                    content = law.get('content', '')
+                    if len(content) > 500:
+                        st.markdown(content[:500] + "...")
+                    else:
+                        st.markdown(content)
+    
+    # Tab 3: Extracted Facts
+    with tab3:
+        facts = case_data["extracted_facts"]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Names Mentioned:**")
+            if facts.get("names"):
+                for name in facts["names"]:
+                    st.write(f"• {name}")
+            else:
+                st.write("None extracted")
+            
+            st.markdown("**Dates:**")
+            if facts.get("dates"):
+                for date in facts["dates"]:
+                    st.write(f"• {date}")
+            else:
+                st.write("None extracted")
+        
+        with col2:
+            st.markdown("**Amounts:**")
+            if facts.get("amounts"):
+                for amt in facts["amounts"]:
+                    st.write(f"• {amt}")
+            else:
+                st.write("None extracted")
+            
+            st.markdown("**Addresses:**")
+            if facts.get("addresses"):
+                for addr in facts["addresses"]:
+                    st.write(f"• {addr}")
+            else:
+                st.write("None extracted")
+        
+        st.markdown("**Important Facts:**")
+        if facts.get("important_facts"):
+            for fact in facts["important_facts"]:
+                st.write(f"• {fact}")
+        else:
+            st.write("None extracted")
+    
+    # Tab 4: Case Strength
+    with tab4:
+        strength = case_data["case_strength"]
+        score = strength["score"]
+        breakdown = strength["breakdown"]
+        
+        # Score display
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.markdown(f"<div class='score-display'>{score}/100</div>", unsafe_allow_html=True)
+            st.markdown(f"**{get_strength_label(score)}**")
+        
+        with col2:
+            st.markdown("**Score Breakdown:**")
+            st.markdown(f"• Agreement: {breakdown['agreement_present']} pts")
+            st.markdown(f"• Payment Proof: {breakdown['payment_proof']} pts")
+            st.markdown(f"• Communication: {breakdown['communication_evidence']} pts")
+            st.markdown(f"• Law Match: {breakdown['law_match']} pts")
+            st.markdown(f"• Timeline: {breakdown['timeline_consistency']} pts")
+            st.markdown(f"• Witnesses: {breakdown['witnesses']} pts")
+            st.markdown(f"• Documentation: {breakdown['documentation_completeness']} pts")
+        
+        st.divider()
+        
+        st.markdown("**Analysis:**")
+        st.markdown(strength["reasoning"])
+        
+        if strength.get("strengths"):
+            st.markdown("**Case Strengths:**")
+            for s in strength["strengths"]:
+                st.write(f"✓ {s}")
+        
+        if strength.get("risk_factors"):
+            st.markdown("**Risk Factors:**")
+            for r in strength["risk_factors"]:
+                st.write(f"⚠️ {r}")
+    
+    # Tab 5: Legal Notice
+    with tab5:
+        notice = case_data["legal_notice"]
+        
+        # Display formatted notice
+        st.markdown("### 📄 FORMAL LEGAL NOTICE")
+        
+        with st.expander("View Full Legal Notice", expanded=True):
+            st.text(notice["legal_notice"])
+        
+        if notice.get("consumer_complaint"):
+            with st.expander("View Complaint/Formal Document"):
+                st.text(notice["consumer_complaint"])
+        
+        with st.expander("View Summary"):
+            st.markdown(notice["summary"])
+        
+        # Download option
+        notice_full_text = f"""
+{'='*80}
+GENERATED LEGAL NOTICE
+{'='*80}
+
+DATE: {notice["date_generated"]}
+
+{notice["legal_notice"]}
+
+{'='*80}
+"""
+        if notice.get("consumer_complaint"):
+            notice_full_text += f"""
+CONSUMER COMPLAINT / FORMAL DOCUMENT:
+{notice["consumer_complaint"]}
+
+{'='*80}
+"""
+        
+        notice_full_text += f"""
+SUMMARY:
+{notice["summary"]}
+
+{'='*80}
+"""
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.download_button(
+                label="📥 Download Notice (TXT)",
+                data=notice_full_text,
+                file_name=f"Legal_Notice_{case_data['classification'].dispute_type}.txt",
+                mime="text/plain",
+            )
+        
+        with col2:
+            st.markdown("""
+            **Next Steps:**
+            1. Review the generated notice carefully
+            2. Have it reviewed by a qualified lawyer
+            3. Serve it to the opposing party as per law
+            4. Keep copies for your records
+            5. Follow up as per the timeline specified
+            """)
+
+
+# ─────────────────────────────────────────────────────────
+# Main App Flow
+# ─────────────────────────────────────────────────────────
+
+def main():
+    """Main application flow."""
+    
+    # Validate environment
+    try:
+        validate_env_variables()
+    except ValueError as e:
+        st.error(f"⚠️ Configuration Error: {str(e)}")
+        st.info("Please check your .env file contains GEMINI_API_KEY and MONGODB_URI")
+        st.stop()
+    
+    # Render sidebar
+    render_sidebar()
+    
+    # Render main content
+    render_main()
+
+
+if __name__ == "__main__":
+    main()
